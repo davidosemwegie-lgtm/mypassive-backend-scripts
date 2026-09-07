@@ -1,0 +1,17 @@
+{
+  "scriptId": "1tBUtrfWITACDtbl0BDNiA7D0QCJF9q32mmGUIFAusg-X6VPuKRCZ-6RF",
+  "rootDir": "",
+  "projectId": "clasp-runner-507819",
+  "scriptExtensions": [
+    ".js",
+    ".gs"
+  ],
+  "htmlExtensions": [
+    ".html"
+  ],
+  "jsonExtensions": [
+    ".json"
+  ],
+  "filePushOrder": [],
+  "skipSubdirectories": false
+}
