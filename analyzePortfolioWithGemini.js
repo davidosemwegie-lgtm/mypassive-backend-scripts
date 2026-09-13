@@ -4,10 +4,11 @@
  * Single-file solution:
  *   1. Authenticates to Firestore REST API using Service Account JSON.
  *   2. Queries active investments for user 'Akk9Yh5dHzRb3IgjF9rOBJk1xex2'.
- *   3. Analyzes each active investment using Gemini (gemini-3.5-flash) for resilience and geographic exposure.
- *   4. Patches 'resilience_short', 'resilience_long', and 'geo_exposure' back to Firestore.
- *   5. Includes a 3-attempt Retry Loop for API/JSON truncation glitches.
- *   6. Sends a summary email report upon completion.
+ *   3. Analyzes each active investment using Gemini (gemini-3.5-flash) strictly matching ISIN + Name.
+ *   4. Validates that the AI-analyzed identity strictly matches the Firestore document before writing.
+ *   5. Patches 'resilience_short', 'resilience_long', and 'geo_exposure' back to Firestore.
+ *   6. Includes a 3-attempt Retry Loop for API/JSON truncation glitches.
+ *   7. Sends a summary email report upon completion.
  *
  * Required Script Properties:
  *   - FIREBASE_SERVICE_ACCOUNT_JSON  (Full service account JSON string)
@@ -39,14 +40,14 @@ function analyzePortfolioWithGemini() {
   const successfulList = [];
   const failedList = [];
 
-  // 3. Process Each Investment with a Retry Loop
+  // 3. Process Each Investment with Strict Guardrails
   activeInvestments.forEach((inv, index) => {
-    const isin = inv.symbol || "";
-    const fundName = inv.name || "";
-    const emailName = inv.name_title_case || fundName || "Unknown Fund";
+    const isin = (inv.symbol || "").trim();
+    const fundName = (inv.name_title_case || inv.name || "").trim();
+    const emailName = fundName || isin || "Unknown Fund";
 
-    if (!isin || !fundName) {
-      failedList.push(`${emailName} (${inv.docPath}): Missing Symbol or Name`);
+    if (!isin) {
+      failedList.push(`${emailName} (${inv.docPath}): Missing ISIN/Symbol`);
       return;
     }
 
@@ -63,11 +64,16 @@ function analyzePortfolioWithGemini() {
           fundName,
         });
 
+        // Verification guard: Ensure Gemini analyzed the requested ISIN
+        if (summaries.analyzed_isin && summaries.analyzed_isin.toUpperCase() !== isin.toUpperCase()) {
+          throw new Error(`AI Hallucination Mismatch: Requested ${isin}, but model processed ${summaries.analyzed_isin} (${summaries.analyzed_fund_name})`);
+        }
+
         const resilienceShortWithDate = `${summaries.resilience_short} ${runDateStamp}`.trim();
         const resilienceLongWithDate = `${summaries.resilience_long} ${runDateStamp}`.trim();
         const geoExposureWithDate = `${summaries.geo_exposure} ${runDateStamp}`.trim();
 
-        // 4. Update Firestore Document
+        // 4. Update Target Firestore Document
         updateInvestmentResilienceFields_({
           projectId: PROJECT_ID,
           docPath: inv.docPath,
@@ -77,18 +83,20 @@ function analyzePortfolioWithGemini() {
           geoExposure: geoExposureWithDate,
         });
 
-        successfulList.push(emailName);
-        success = true; // Break the retry loop
+        Logger.log(`Successfully updated doc [${inv.docPath}] for ${isin} (${fundName})`);
+        successfulList.push(`${emailName} (${isin})`);
+        success = true;
       } catch (e) {
         if (attempts < maxAttempts) {
           Utilities.sleep(3000);
         } else {
-          failedList.push(`${emailName}: ${e.message}`);
+          Logger.log(`Failed doc [${inv.docPath}] for ${isin}: ${e.message}`);
+          failedList.push(`${emailName} (${isin}): ${e.message}`);
         }
       }
     }
 
-    // Rate-limiting delay between Gemini calls for the next fund
+    // Rate-limiting pause between Gemini calls
     if (index < activeInvestments.length - 1) {
       Utilities.sleep(1000);
     }
@@ -130,7 +138,7 @@ function sendEmailReport_({ successes, failures }) {
 }
 
 /**
- * Generates analysis with Gemini API using the active gemini-3.5-flash endpoint.
+ * Generates analysis with Gemini API, requiring strict identity validation.
  */
 function generateResilienceWithGemini_({ geminiKey, isin, fundName }) {
   const url = `https://generativelanguage.googleapis.com/v1/models/gemini-3.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`;
@@ -143,37 +151,44 @@ function generateResilienceWithGemini_({ geminiKey, isin, fundName }) {
 
   const prompt = `You are a financial analyst generating data-rich resilience, outlook summaries, and geographic exposure breakdowns for a mutual fund or ETF.
 Analysis Date: ${currentDate}
-Fund Name: ${fundName}
-ISIN/Identifier: ${isin}
+Target ISIN: ${isin}
+Target Fund Name: ${fundName || "Identify strictly via ISIN"}
+
+CRITICAL IDENTIFICATION & GROUNDING INSTRUCTIONS:
+- You must analyze the exact fund and share class tied to ISIN ${isin}.
+- In the JSON response, return the exact ISIN you evaluated in "analyzed_isin", and the official Title Case fund name in "analyzed_fund_name".
+- If the fund name provided above differs slightly from the official registration for ISIN ${isin}, prioritize the security tied to ISIN ${isin}.
 
 CRITICAL DATA & OUTLOOK REQUIREMENTS:
 1. YIELD & CAGR: Include current yield (%) and compound annual growth rate (CAGR %). Provide CAGR for up to 10 years if available. If 10-year data is unavailable, state the available multi-year CAGR and explicitly state the exact period (e.g., "3-yr CAGR: 5.2%").
 2. DIVIDEND RESILIENCE: State specific facts regarding dividend reliability (e.g., consecutive payment history, cuts, or payout stability).
 3. DOWNTURN PERFORMANCE: Provide factual performance figures during major market downturns (2008 Financial Crisis and 2020 COVID-19 crash, if existed).
 4. SHORT TO MEDIUM-TERM OUTLOOK: Evaluate the fund's short-to-medium-term outlook (6 to 24 months) considering prevailing macroeconomic factors as of ${currentDate} (e.g., current rate environment, market valuation levels, sector tailwinds/headwinds, inflation trends).
-5. GEOGRAPHIC EXPOSURE: Using ISIN ${isin}, provide the percentage exposure breakdown of the fund across these exact regions/countries: USA, China, India, Europe, Rest of Asia, Canada, South America, and Other markets.
+5. GEOGRAPHIC EXPOSURE: Provide the percentage exposure breakdown across these exact regions/countries: USA, China, India, Europe, Rest of Asia, Canada, South America, and Other markets.
 
 OUTPUT FORMAT INSTRUCTIONS:
-- NAMING: Always refer to the fund by its name ("${fundName}"), but strictly format the name in standard Title Case (e.g., "Franklin Income Fund", do not use ALL CAPS). STRICT RULE: Do not include the ISIN in the resilience_short or resilience_long generated output.
+- STRICT RULE: Do not include the raw ISIN string inside the text of "resilience_short" or "resilience_long".
 - resilience_short: Maximum 280 characters. Extremely dense, plain English, no markdown, no emojis. Synthesize Yield, CAGR, downturn resilience, and a concise 1-sentence current market outlook.
-- resilience_long: Provide a highly detailed, data-rich analysis that is at least 4 distinct paragraphs long. Structure the analysis to dedicate specific paragraphs to: (1) Yield and historical CAGR performance, (2) Dividend reliability and payout history, (3) Downturn stress-test performance (2008/2020 crashes), and (4) A forward-looking macroeconomic outlook. Focus strictly on factual investment metrics, actionable insights, and prevailing economic headwinds/tailwinds as of ${currentDate}. Strictly avoid repetitive filler, generic AI disclaimers, or flowery language. Plain English, no markdown. Use standard newline characters to separate paragraphs within the JSON string.
-- geo_exposure: Plain English breakdown of percentage exposure for ISIN ${isin} across: USA, China, India, Europe, Rest of Asia, Canada, South America, and Other markets (e.g., USA: 50%, Europe: 20%, China: 10%, India: 5%, Rest of Asia: 5%, Canada: 5%, South America: 3%, Other: 2%). Plain English, no markdown.
+- resilience_long: Provide a highly detailed, data-rich analysis that is at least 4 distinct paragraphs long. Dedicate specific paragraphs to: (1) Yield and historical CAGR performance, (2) Dividend reliability and payout history, (3) Downturn stress-test performance (2008/2020 crashes), and (4) A forward-looking macroeconomic outlook. Focus strictly on factual investment metrics, actionable insights, and prevailing economic headwinds/tailwinds as of ${currentDate}. Strictly avoid repetitive filler, generic AI disclaimers, or flowery language. Plain English, no markdown. Use standard newline characters to separate paragraphs within the JSON string.
+- geo_exposure: Plain English breakdown of percentage exposure across: USA, China, India, Europe, Rest of Asia, Canada, South America, and Other markets (e.g., USA: 50%, Europe: 20%, China: 10%, India: 5%, Rest of Asia: 5%, Canada: 5%, South America: 3%, Other: 2%). Plain English, no markdown.
 - CONSERVATIVE FALLBACK: If historical data or specific metrics are missing due to recent fund inception, explicitly declare what data is unavailable. Do not invent metrics.`;
 
   const payload = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
     generationConfig: { 
-      temperature: 0.2, 
+      temperature: 0.1, 
       maxOutputTokens: 8192,
       responseMimeType: "application/json",
       responseSchema: {
         type: "OBJECT",
         properties: {
+          analyzed_isin: { type: "STRING" },
+          analyzed_fund_name: { type: "STRING" },
           resilience_short: { type: "STRING" },
           resilience_long: { type: "STRING" },
           geo_exposure: { type: "STRING" }
         },
-        required: ["resilience_short", "resilience_long", "geo_exposure"]
+        required: ["analyzed_isin", "analyzed_fund_name", "resilience_short", "resilience_long", "geo_exposure"]
       }
     },
   };
@@ -198,6 +213,8 @@ OUTPUT FORMAT INSTRUCTIONS:
   }
 
   return {
+    analyzed_isin: String(json.analyzed_isin || "").trim(),
+    analyzed_fund_name: String(json.analyzed_fund_name || "").trim(),
     resilience_short: String(json.resilience_short || "").trim(),
     resilience_long: String(json.resilience_long || "").trim(),
     geo_exposure: String(json.geo_exposure || "").trim(),
@@ -245,9 +262,12 @@ function fetchActiveUserInvestments_({ projectId, userId, accessToken }) {
     const docPath = doc.name.replace(`projects/${projectId}/databases/(default)/documents/`, "");
     const fields = doc.fields || {};
 
+    // Check symbol, isin, or ticker field variations safely
+    const symbol = getStringField_(fields, "symbol") || getStringField_(fields, "isin") || getStringField_(fields, "ticker");
+
     out.push({
       docPath,
-      symbol: getStringField_(fields, "symbol"),
+      symbol,
       name: getStringField_(fields, "name"),
       name_title_case: getStringField_(fields, "name_title_case"),
       is_active: getBoolField_(fields, "is_active"),
