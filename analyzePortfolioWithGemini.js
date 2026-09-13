@@ -84,14 +84,14 @@ function analyzePortfolioWithGemini() {
         });
 
         Logger.log(`Successfully updated doc [${inv.docPath}] for ${isin} (${fundName})`);
-        successfulList.push(`${emailName} (${isin})`);
+        successfulList.push(`${emailName}`);
         success = true;
       } catch (e) {
         if (attempts < maxAttempts) {
           Utilities.sleep(3000);
         } else {
           Logger.log(`Failed doc [${inv.docPath}] for ${isin}: ${e.message}`);
-          failedList.push(`${emailName} (${isin}): ${e.message}`);
+          failedList.push(`${emailName}: ${e.message}`);
         }
       }
     }
